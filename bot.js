@@ -1,85 +1,353 @@
-const puppeteer = require("puppeteer");
-const config = require("./config.json");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
+const config = require("./config.json");
+
 const token = config.TELEGRAM_TOKEN;
 let vndUsdt;
 let isActive = true;
-let timeoutIds = [];
 
 const bot = new TelegramBot(token, { polling: true });
-let binanceFee = 0.2; // Default 0.2%
-let okcoinFee = 0.2; // Default 0.2%
+let binanceFee = 0.2;
+let okcoinFee = 0.2;
 let bitFlyerFee = 0.2;
 
+// Object to store command states for each chat
+const chatCommands = {};
+
+// Function to get or create a chat command state
+const getChatCommandState = (chatId) => {
+  if (!chatCommands[chatId]) {
+    chatCommands[chatId] = {
+      currentCommand: null,
+      timeoutId: null,
+    };
+  }
+  return chatCommands[chatId];
+};
+
+// Function to cancel the current command for a specific chat
+const cancelCurrentCommand = (chatId) => {
+  const chatState = getChatCommandState(chatId);
+  if (chatState.timeoutId) {
+    clearTimeout(chatState.timeoutId);
+    chatState.timeoutId = null;
+    if (chatState.currentCommand) {
+      bot.sendMessage(
+        chatId,
+        `Command ${chatState.currentCommand} has been cancelled.`
+      );
+    }
+    chatState.currentCommand = null;
+  }
+};
+
+// Function to start a new command for a specific chat
+const startCommand = (chatId, command, callback) => {
+  cancelCurrentCommand(chatId);
+  const chatState = getChatCommandState(chatId);
+  chatState.currentCommand = command;
+  bot.sendMessage(chatId, `Command ${command} is running!`);
+  callback();
+};
+
+// Function to get the current buy price
+const getCurrentBuyPrice = async () => {
+  try {
+    const buyResponse = await axios.post(
+      "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+      {
+        asset: "USDT",
+        fiat: "VND",
+        tradeType: "BUY",
+        page: 1,
+        rows: 1,
+        payTypes: [],
+        publisherType: null,
+        merchantCheck: false,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    const price = buyResponse.data.data[0]?.adv?.price;
+    return price ? parseFloat(price).toLocaleString("en-US") : "N/A";
+  } catch (error) {
+    console.error("Error getting current buy price:", error.message);
+    return "Error";
+  }
+};
+
+// Function to get the VND price
+const getVNDPrice = async () => {
+  try {
+    const sellResponse = await axios.post(
+      "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+      {
+        asset: "USDT",
+        fiat: "VND",
+        tradeType: "SELL",
+        page: 1,
+        rows: 3,
+        payTypes: [],
+        publisherType: null,
+        merchantCheck: false,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    const prices = sellResponse.data.data
+      .map((ad) => parseFloat(ad.adv.price))
+      .filter((price) => !isNaN(price));
+    if (prices.length === 0) return "N/A";
+    const average =
+      prices.reduce((sum, price) => sum + price, 0) / prices.length;
+    return average.toFixed(2);
+  } catch (error) {
+    console.error("Error getting VND price:", error.message);
+    return "Error";
+  }
+};
+
+// Function to get Bitcoin price from Binance
+const getBitcoinPriceFromBinance = async () => {
+  try {
+    const response = await axios.get(
+      "https://api.binance.com/api/v3/ticker/price",
+      {
+        params: {
+          symbol: "BTCUSDT",
+        },
+      }
+    );
+    const price = parseFloat(response.data.price);
+    return isNaN(price) ? "N/A" : price.toFixed(2);
+  } catch (error) {
+    console.error("Error getting Bitcoin price from Binance:", error.message);
+    return "Error";
+  }
+};
+
+// Function to get price from Binance
+const getPriceFromBinance = async () => {
+  try {
+    const response = await axios.get("https://api.binance.com/api/v3/depth", {
+      params: {
+        symbol: "BTCJPY",
+        limit: 10,
+      },
+    });
+    const asks = response.data.asks
+      .map((ask) => parseFloat(ask[0]))
+      .filter((ask) => !isNaN(ask));
+    return asks.length > 0 ? asks[0].toFixed(2) : "N/A";
+  } catch (error) {
+    console.error("Error getting price from Binance:", error.message);
+    return "Error";
+  }
+};
+
+// Function to get price from Okcoin
+const getPriceFromOkcoin = async () => {
+  try {
+    const response = await axios.get(
+      "https://www.okcoin.jp/api/spot/v3/instruments/BTC-JPY/book",
+      {
+        params: {
+          size: 14,
+        },
+      }
+    );
+    const asks = response.data.asks
+      .map((ask) => parseFloat(ask[0]))
+      .filter((ask) => !isNaN(ask));
+    return asks.length > 0 ? asks[0].toFixed(2) : "N/A";
+  } catch (error) {
+    console.error("Error getting price from Okcoin:", error.message);
+    return "Error";
+  }
+};
+
+// Function to get price from BitFlyer
+const getPriceFromBitFlyer = async () => {
+  try {
+    const response = await axios.get("https://api.bitflyer.com/v1/board", {
+      params: {
+        product_code: "BTC_JPY",
+      },
+    });
+    const asks = response.data.asks
+      .map((ask) => parseFloat(ask.price))
+      .filter((ask) => !isNaN(ask));
+    return asks.length > 0 ? asks[0].toFixed(2) : "N/A";
+  } catch (error) {
+    console.error("Error getting price from BitFlyer:", error.message);
+    return "Error";
+  }
+};
+
+// Function to calculate price
+const calculatePrice = (usdtToVnd, btcToUsdt, btcToJpy, fee) => {
+  return (usdtToVnd * btcToUsdt) / btcToJpy - fee / 100;
+};
+
+// Function to format number with commas
+const formatNumberWithCommas = (number) => {
+  if (isNaN(number)) return number;
+  return number.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+};
+
+// Function to get three digits after decimal
+const getThreeDigitsAfterDecimal = (numberString) => {
+  const cleanedString = numberString.replace(/,/g, "").replace(".", ".");
+  const decimalIndex = cleanedString.indexOf(".");
+
+  if (decimalIndex !== -1) {
+    const integerPart = cleanedString.substring(0, decimalIndex);
+    const decimalPart = cleanedString.substring(decimalIndex + 1);
+    const threeDecimalDigits = decimalPart.slice(0, 3).padEnd(3, "0");
+    return `${integerPart}.${threeDecimalDigits}`;
+  } else {
+    return `${cleanedString}.000`;
+  }
+};
+
+// Function to get P2P prices
+const getP2PPrices = async () => {
+  try {
+    const buyResponse = await axios.post(
+      "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+      {
+        asset: "USDT",
+        fiat: "VND",
+        tradeType: "BUY",
+        page: 1,
+        rows: 11,
+        payTypes: [],
+        publisherType: null,
+        merchantCheck: false,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    const sellResponse = await axios.post(
+      "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+      {
+        asset: "USDT",
+        fiat: "VND",
+        tradeType: "SELL",
+        page: 1,
+        rows: 11,
+        payTypes: [],
+        publisherType: null,
+        merchantCheck: false,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    const buyAds = buyResponse.data.data;
+    const sellAds = sellResponse.data.data;
+    const buyPrices = buyAds.slice(1).map((ad) => ad.adv.price);
+    const sellPrices = sellAds.slice(1).map((ad) => ad.adv.price);
+    let output = "BUY        -       SELL\n";
+    for (let i = 0; i < 10; i++) {
+      if (i < buyPrices.length && i < sellPrices.length) {
+        output += `${parseFloat(
+          buyPrices[i]
+        ).toLocaleString()}             ${parseFloat(
+          sellPrices[i]
+        ).toLocaleString()}\n`;
+      }
+    }
+    return output;
+  } catch (error) {
+    console.error("Error fetching P2P prices:", error.message);
+    return "Error fetching P2P prices";
+  }
+};
+
+// Bot command handlers
 bot.onText(/\/start/, (msg) => {
-  const firstName = msg.from.first_name || "Không có tên";
+  const firstName = msg.from.first_name || "No name";
   const lastName = msg.from.last_name || "";
   const fullName = `${firstName} ${lastName}`.trim();
   const chatId = msg.chat.id;
-  bot.sendAnimation(
+  bot.sendMessage(
     chatId,
-    `Xin chào ${fullName}. Sử dụng lệnh /i để xem cách sử dụng Bot`
+    `Hello ${fullName}. Use the /i command to see how to use the Bot`
   );
 });
 
 bot.onText(/\/binance (\d+\.\d+)/, (msg, match) => {
   const chatId = msg.chat.id;
-  binanceFee = parseFloat(match[1]) / 100; // Convert percentage to decimal
-  bot.sendMessage(chatId, `Phí Binance đã được cập nhật thành ${match[1]}%`);
+  binanceFee = parseFloat(match[1]) / 100;
+  bot.sendMessage(chatId, `Binance fee has been updated to ${match[1]}%`);
 });
 
 bot.onText(/\/okc (\d+\.\d+)/, (msg, match) => {
   const chatId = msg.chat.id;
-  okcoinFee = parseFloat(match[1]) / 100; // Convert percentage to decimal
-  bot.sendMessage(chatId, `Phí Okcoin đã được cập nhật thành ${match[1]}%`);
+  okcoinFee = parseFloat(match[1]) / 100;
+  bot.sendMessage(chatId, `Okcoin fee has been updated to ${match[1]}%`);
 });
 
 bot.onText(/\/bit (\d+\.\d+)/, (msg, match) => {
   const chatId = msg.chat.id;
-  bitFlyerFee = parseFloat(match[1]) / 100; // Convert percentage to decimal
-  bot.sendMessage(chatId, `Phí BitFlyer đã được cập nhật thành ${match[1]}%`);
+  bitFlyerFee = parseFloat(match[1]) / 100;
+  bot.sendMessage(chatId, `BitFlyer fee has been updated to ${match[1]}%`);
 });
 
 bot.onText(/\/stop/, (msg) => {
   isActive = false;
   const chatId = msg.chat.id;
-  timeoutIds.forEach((id) => clearTimeout(id));
-  timeoutIds = [];
-  console.log("Bot tạm thời nghỉ ngơi nhé...");
-  bot.sendMessage(chatId, "Bot tạm thời nghỉ ngơi nhé...");
+  cancelCurrentCommand(chatId);
+  console.log("Bot is đang nghỉ ngơi...");
+  bot.sendMessage(chatId, "Bot đang nghỉ ngơi...");
 });
 
 bot.onText(/\/resume/, (msg) => {
   const chatId = msg.chat.id;
   isActive = true;
   console.log("Bot is running...");
-  bot.sendMessage(chatId, "Bot đang hoạt động...");
+  bot.sendMessage(chatId, "Bot is running...");
 });
 
-bot.on("message", async (msg) => {
+bot.onText(/\/t (\d+)p/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const userMessage = msg.text;
-  const firstName = msg.from.first_name || "Không có tên";
-  const lastName = msg.from.last_name || "";
-  const fullName = `${firstName} ${lastName}`.trim();
+  const minutes = parseInt(match[1], 10);
+  const interval = minutes * 60 * 1000;
 
-  if (isActive && userMessage) {
-    if (userMessage === "/start") {
-      bot.sendMessage(
-        chatId,
-        `Xin chào ${fullName}
-Sử dụng lệnh /i để xem cách sử dụng Bot`
-      );
-    }
-    if (userMessage === "/t") {
+  await bot.sendMessage(chatId, `Command /t ${minutes}p is running`);
+
+  const sendP2PPrices = async () => {
+    if (!isActive) return;
+    try {
       const prices = await getP2PPrices();
-      bot.sendMessage(chatId, prices);
+      await bot.sendMessage(chatId, prices);
+      const chatState = getChatCommandState(chatId);
+      chatState.timeoutId = setTimeout(sendP2PPrices, interval);
+    } catch (error) {
+      bot.sendMessage(chatId, `Error getting P2P prices: ${error.message}`);
     }
-    if (userMessage === "/i") {
-      bot.sendMessage(
-        chatId,
-        `Các lệnh của bot
+  };
+
+  sendP2PPrices();
+});
+
+bot.onText(/\/i/, (msg) => {
+  const chatId = msg.chat.id;
+  bot.sendMessage(
+    chatId,
+    `Các lệnh của bot
 2.1. Cập nhật phí giao dịch
 /binance <percentage>: Cập nhật phí giao dịch của Binance. Ví dụ: /binance 0.25 để cập nhật phí là 0.25%.
 /okc <percentage>: Cập nhật phí giao dịch của Okcoin. Ví dụ: /okc 0.25.
@@ -91,94 +359,106 @@ Sử dụng lệnh /i để xem cách sử dụng Bot`
 /i: Hiển thị hướng dẫn sử dụng bot.
 2.4. Gửi giá theo khoảng thời gian
 /a <minutes>p: Bot sẽ gửi thông tin giá theo định kỳ mỗi <minutes> phút. Ví dụ: /a 3p để bot gửi thông tin mỗi 3 phút.
+/s <interval>p <vndPrice> <stopAfter>p: Bot sẽ gửi thông tin giá mỗi <interval> phút và sẽ dừng sau <stopAfter> phút. Ví dụ: /s 3p 25345 60p để bot gửi thông tin mỗi 3 phút với giá VND/USDT là 25345 và dừng sau 60 phút.
+/t <minutes>p: Bot sẽ gửi thông tin giá P2P theo định kỳ mỗi <minutes> phút. Ví dụ: /t 5p để bot gửi thông tin giá P2P mỗi 5 phút.`
+  );
+});
 
-/s <interval>p <vndPrice> <stopAfter>p: Bot sẽ gửi thông tin giá mỗi <interval> phút và sẽ dừng sau <stopAfter> phút. Ví dụ: /s 3p 25345 60p để bot gửi thông tin mỗi 3 phút với giá VND/USDT là 25345 và dừng sau 60 phút.`
-      );
-    }
+bot.onText(/\/t/, async (msg) => {
+  const chatId = msg.chat.id;
 
-    const match = userMessage.match(/^\/a (\d+)p$/);
-    if (match) {
-      bot.sendMessage(chatId, `Lệnh ${userMessage} đang được chạy!`);
+  const prices = await getP2PPrices();
+  bot.sendMessage(chatId, prices);
+});
+
+bot.onText(/\/a (\d+)p/, (msg, match) => {
+  const chatId = msg.chat.id;
+  const minutes = parseInt(match[1], 10);
+
+  startCommand(chatId, `/a ${minutes}p`, () => {
+    const interval = minutes * 60 * 1000;
+    const fetchAndSendPrices = async () => {
       if (!isActive) return;
-      const minutes = parseInt(match[1], 10);
-      const interval = minutes * 60 * 1000;
-      const fetchAndSendPrices = async () => {
-        try {
-          const startTime = Date.now();
-          const [
-            vndFromBuy,
-            vndPrice,
-            btcUsdt,
-            binanceData,
-            okcoinData,
-            bitFlyerData,
-          ] = await Promise.all([
-            getCurrentBuyPrice(),
-            getVNDPrice(),
-            getBitcoinPriceFromBinance(),
-            getPriceFromBinance(),
-            getPriceFromOkcoin(),
-            getPriceFromBitFlyer(),
-          ]);
+      try {
+        const startTime = Date.now();
+        const [
+          vndFromBuy,
+          vndPrice,
+          btcUsdt,
+          binanceData,
+          okcoinData,
+          bitFlyerData,
+        ] = await Promise.all([
+          getCurrentBuyPrice(),
+          getVNDPrice(),
+          getBitcoinPriceFromBinance(),
+          getPriceFromBinance(),
+          getPriceFromOkcoin(),
+          getPriceFromBitFlyer(),
+        ]);
 
-          const calculatedBinancePrice = calculatePrice(
-            vndPrice,
-            btcUsdt,
-            binanceData[0],
-            binanceFee
-          );
-          const calculatedOkcoinPrice = calculatePrice(
-            vndPrice,
-            btcUsdt,
-            okcoinData[0]?.toString().replace(/,/g, ""),
-            okcoinFee
-          );
-          const calculatedBitFlyerPrice = calculatePrice(
-            vndPrice,
-            btcUsdt,
-            bitFlyerData.price,
-            bitFlyerFee
-          );
+        const calculatedBinancePrice = calculatePrice(
+          parseFloat(vndPrice),
+          parseFloat(btcUsdt),
+          parseFloat(binanceData),
+          binanceFee
+        );
+        const calculatedOkcoinPrice = calculatePrice(
+          parseFloat(vndPrice),
+          parseFloat(btcUsdt),
+          parseFloat(okcoinData),
+          okcoinFee
+        );
+        const calculatedBitFlyerPrice = calculatePrice(
+          parseFloat(vndPrice),
+          parseFloat(btcUsdt),
+          parseFloat(bitFlyerData),
+          bitFlyerFee
+        );
 
-          await bot.sendMessage(
-            chatId,
-            `Binance: ${Number(binanceData[0]).toLocaleString("en-US")}
-Okcoin:  ${okcoinData[0]}
-Bitflyer:  ${Number(bitFlyerData.price).toLocaleString("en-US")}
+        await bot.sendMessage(
+          chatId,
+          `Binance: ${formatNumberWithCommas(binanceData)}
+Okcoin: ${formatNumberWithCommas(okcoinData)}
+Bitflyer: ${formatNumberWithCommas(bitFlyerData)}
 ---------------------------
-VND: ${vndFromBuy} - ${Number(vndPrice).toLocaleString("en-US")}
-BTCUSDT: ${btcUsdt.toLocaleString("en-US")}
+VND: ${vndFromBuy} - ${formatNumberWithCommas(vndPrice)}
+USDT: ${formatNumberWithCommas(btcUsdt)}
 ---------------------------
 Binance: ${getThreeDigitsAfterDecimal(calculatedBinancePrice.toString())}
-Okcoin:  ${getThreeDigitsAfterDecimal(calculatedOkcoinPrice.toString())}
-Bitflyer:  ${getThreeDigitsAfterDecimal(calculatedBitFlyerPrice.toString())}`
+Okcoin: ${getThreeDigitsAfterDecimal(calculatedOkcoinPrice.toString())}
+Bitflyer: ${getThreeDigitsAfterDecimal(calculatedBitFlyerPrice.toString())}`
+        );
+
+        const executionTime = Date.now() - startTime;
+        const adjustedInterval = interval - executionTime;
+        const chatState = getChatCommandState(chatId);
+        if (chatState.currentCommand === `/a ${minutes}p`) {
+          chatState.timeoutId = setTimeout(
+            fetchAndSendPrices,
+            Math.max(0, adjustedInterval)
           );
-
-          const executionTime = Date.now() - startTime;
-          const adjustedInterval = interval - executionTime;
-          const timeoutId = setTimeout(fetchAndSendPrices, adjustedInterval);
-          timeoutIds.push(timeoutId);
-          // if (adjustedInterval > 0) {
-          //   setTimeout(fetchAndSendPrices, adjustedInterval);
-          // } else {
-          //   setImmediate(fetchAndSendPrices);
-          // }
-        } catch (error) {
-          bot.sendMessage(chatId, `Lỗi khi lấy dữ liệu: ${error.message}`);
         }
-      };
-      fetchAndSendPrices();
-    }
+      } catch (error) {
+        bot.sendMessage(chatId, `Error fetching data: ${error.message}`);
+      }
+    };
+    fetchAndSendPrices();
+  });
+});
 
-    const match2 = userMessage.match(/^\/s (\d+)p (\d+) (\d+)p$/);
-    if (match2) {
-      bot.sendMessage(chatId, `Lệnh ${userMessage} đang được chạy!`);
+bot.onText(/\/s (\d+)p (\d+) (\d+)p/, (msg, match) => {
+  const chatId = msg.chat.id;
+  const [_, intervalMinutes, vndPrice, stopAfterMinutes] = match.map(Number);
 
-      const [_, intervalMinutes, vndPrice, stopAfterMinutes] =
-        match2.map(Number);
+  startCommand(
+    chatId,
+    `/s ${intervalMinutes}p ${vndPrice} ${stopAfterMinutes}p`,
+    () => {
       const interval = intervalMinutes * 60 * 1000;
       const stopAfter = stopAfterMinutes * 60 * 1000;
       const startTime = Date.now();
+
       const fetchAndSendPrices = async () => {
         if (!isActive) return;
         try {
@@ -195,294 +475,59 @@ Bitflyer:  ${getThreeDigitsAfterDecimal(calculatedBitFlyerPrice.toString())}`
             ]);
 
           const calculatedBinancePrice = calculatePrice(
-            vndPrice,
-            btcUsdt,
-            binanceData[0],
+            parseFloat(vndPrice),
+            parseFloat(btcUsdt),
+            parseFloat(binanceData),
             binanceFee
           );
           const calculatedOkcoinPrice = calculatePrice(
-            vndPrice,
-            btcUsdt,
-            okcoinData[0].toString().replace(/,/g, ""),
+            parseFloat(vndPrice),
+            parseFloat(btcUsdt),
+            parseFloat(okcoinData),
             okcoinFee
           );
           const calculatedBitFlyerPrice = calculatePrice(
-            vndPrice,
-            btcUsdt,
-            bitFlyerData.price,
+            parseFloat(vndPrice),
+            parseFloat(btcUsdt),
+            parseFloat(bitFlyerData),
             bitFlyerFee
           );
 
-          const formattedBinancePrice = formatNumberWithCommas(binanceData[0]);
-          const formattedOkcoinPrice = formatNumberWithCommas(okcoinData[0]);
-          const formattedBitFlyerPrice = formatNumberWithCommas(
-            bitFlyerData.price
-          );
-          const formattedVNDPrice = formatNumberWithCommas(vndPrice);
-          const formattedBTCUSDT = formatNumberWithCommas(btcUsdt);
-
           await bot.sendMessage(
             chatId,
-            `
-Binance: ${formattedBinancePrice}
-Okcoin:  ${formattedOkcoinPrice}
-Bitflyer:  ${formattedBitFlyerPrice}
+            `Binance: ${formatNumberWithCommas(binanceData)}
+Okcoin: ${formatNumberWithCommas(okcoinData)}
+Bitflyer: ${formatNumberWithCommas(bitFlyerData)}
 —----  FIX U -------
-VND: ${vndFromBuy} - ${formattedVNDPrice}
-BTCUSDT: ${formattedBTCUSDT}
-------------------------
-Binance: ${calculatedBinancePrice.toLocaleString("en-US")}
-Okcoin:  ${calculatedOkcoinPrice.toLocaleString("en-US")}
-Bitflyer:  ${calculatedBitFlyerPrice.toLocaleString("en-US")}
-`
+VND: ${vndFromBuy} - ${formatNumberWithCommas(vndPrice)}
+USDT: ${formatNumberWithCommas(btcUsdt)}
+---------------------------
+Binance: ${getThreeDigitsAfterDecimal(calculatedBinancePrice.toString())}
+Okcoin: ${getThreeDigitsAfterDecimal(calculatedOkcoinPrice.toString())}
+Bitflyer: ${getThreeDigitsAfterDecimal(calculatedBitFlyerPrice.toString())}`
           );
 
-          if (elapsedTime < stopAfter) {
-            const timeoutId = setTimeout(fetchAndSendPrices, interval);
-            timeoutIds.push(timeoutId);
+          const chatState = getChatCommandState(chatId);
+          if (
+            elapsedTime < stopAfter &&
+            chatState.currentCommand ===
+              `/s ${intervalMinutes}p ${vndPrice} ${stopAfterMinutes}p`
+          ) {
+            chatState.timeoutId = setTimeout(fetchAndSendPrices, interval);
+          } else {
+            bot.sendMessage(
+              chatId,
+              `Lệnh /s đã kết thúc sau ${stopAfterMinutes} phút.`
+            );
+            chatState.currentCommand = null;
           }
         } catch (error) {
-          bot.sendMessage(chatId, `Lỗi khi lấy dữ liệu: ${error.message}`);
+          bot.sendMessage(chatId, `Error fetching data: ${error.message}`);
         }
       };
       fetchAndSendPrices();
     }
-  }
+  );
 });
 
-const getPriceFromBinance = async () => {
-  const browser = await puppeteer.launch({ headless: true });
-  const page = await browser.newPage();
-  await page.goto("https://www.binance.com/en-JP/trade/BTC_JPY?type=spot", {
-    waitUntil: "networkidle2",
-  });
-  await page.waitForSelector("div.progress-container");
-  const lastProgressContainer = await page.evaluate(() => {
-    const containers = Array.from(
-      document.querySelectorAll("div.progress-container")
-    );
-    const lastContainer = containers[containers.length - 1];
-    const values = Array.from(
-      lastContainer.querySelectorAll("div.row-content > div")
-    ).map((div) => div.textContent.trim());
-    return values;
-  });
-  await browser.close();
-  return lastProgressContainer;
-};
-
-const getPriceFromOkcoin = async () => {
-  const browser = await puppeteer.launch({ headless: true });
-  const page = await browser.newPage();
-  await page.goto("https://www.okcoin.jp/spot/trade", {
-    waitUntil: "networkidle2",
-  });
-  await page.waitForSelector("li.sell-item");
-  const lastSellItem = await page.evaluate(() => {
-    const items = Array.from(document.querySelectorAll("li.sell-item"));
-    const lastItem = items[items.length - 1];
-    const values = Array.from(lastItem.querySelectorAll("span")).map((span) =>
-      span.textContent.trim()
-    );
-    return values;
-  });
-  await browser.close();
-  return lastSellItem;
-};
-
-const getPriceFromBitFlyer = async () => {
-  let browser = null;
-  try {
-    browser = await puppeteer.launch({ headless: true });
-    const page = await browser.newPage();
-    await page.goto("https://lightning.bitflyer.com/trade", {
-      waitUntil: "networkidle2",
-    });
-    await page.waitForSelector("a.raised.clickable.filled");
-    await page.click("a.raised.clickable.filled");
-    await page.waitForSelector(".offer__inner li", { timeout: 20000 });
-    const lastItemDetails = await page.evaluate(() => {
-      const listItems = document.querySelectorAll(".offer__inner li");
-      if (listItems.length === 0) {
-        return "No items found";
-      }
-      const lastItem = listItems[listItems.length - 1];
-      return {
-        price: lastItem.getAttribute("data-item-price"),
-        ltpFlag: lastItem.getAttribute("data-ltp-flag"),
-        size: lastItem.querySelector(".orderbook__size")
-          ? lastItem.querySelector(".orderbook__size").textContent.trim()
-          : "N/A",
-        priceText: lastItem.querySelector(".orderbook__price")
-          ? lastItem.querySelector(".orderbook__price").textContent.trim()
-          : "N/A",
-      };
-    });
-    return lastItemDetails;
-  } catch (error) {
-    console.error("Lỗi khi lấy dữ liệu:", error.message);
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
-  }
-};
-
-const getVNDPrice = async () => {
-  let browser;
-  try {
-    browser = await puppeteer.launch({ headless: true });
-    const page = await browser.newPage();
-    await page.goto(
-      "https://p2p.binance.com/en-JP/trade/sell/USDT?fiat=VND&payment=all-payments",
-      { waitUntil: "networkidle2" }
-    );
-    await page.waitForSelector("div.headline5.mr-4xs.text-primaryText");
-    const prices = await page.evaluate(() => {
-      const elements = document.querySelectorAll(
-        "div.headline5.mr-4xs.text-primaryText"
-      );
-      return Array.from(elements)
-        .slice(0, 3)
-        .map((element) => {
-          const text = element.textContent.trim().replace(/,/g, "");
-          return parseFloat(text);
-        });
-    });
-
-    await browser.close();
-    vndUsdt = prices[0];
-    const total = prices.reduce((sum, price) => sum + price, 0);
-    const average = (total / prices.length).toString().slice(0, 5);
-    return average;
-  } catch (error) {
-    throw new Error(error.message);
-  }
-};
-
-const getBitcoinPriceFromBinance = async () => {
-  try {
-    const response = await axios.get(
-      "https://api.binance.com/api/v3/ticker/price",
-      {
-        params: {
-          symbol: "BTCUSDT",
-        },
-      }
-    );
-    const price = response.data.price.toString().slice(0, 5);
-    return parseInt(price);
-  } catch (error) {
-    console.error("Lỗi khi lấy giá Bitcoin từ Binance:", error.message);
-  }
-};
-
-const calculatePrice = (usdtToVnd, btcToUsdt, btcToJpy, fee) => {
-  return (usdtToVnd * btcToUsdt) / btcToJpy - fee / 100;
-};
-
-const formatNumberWithCommas = (number) => {
-  if (isNaN(number)) return number;
-  return number.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-};
-
-const getThreeDigitsAfterDecimal = (numberString) => {
-  const cleanedString = numberString.replace(/,/g, "").replace(".", ".");
-  const decimalIndex = cleanedString.indexOf(".");
-
-  if (decimalIndex !== -1) {
-    const integerPart = cleanedString.substring(0, decimalIndex);
-    const decimalPart = cleanedString.substring(decimalIndex + 1);
-    const threeDecimalDigits = decimalPart.slice(0, 3).padEnd(3, "0");
-    return `${integerPart}.${threeDecimalDigits}`;
-  } else {
-    return `${cleanedString}.000`;
-  }
-};
-
-const getCurrentBuyPrice = async () => {
-  const buyResponse = await axios.post(
-    "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-    {
-      asset: "USDT",
-      fiat: "VND",
-      tradeType: "BUY",
-      page: 1,
-      rows: 1,
-      payTypes: [],
-      publisherType: null,
-      merchantCheck: false,
-    },
-    {
-      headers: {
-        "Content-Type": "application/json",
-      },
-    }
-  );
-  return buyResponse.data.data
-    .map((ad) => ad.adv.price)[0]
-    .toLocaleString("en-US");
-};
-const getP2PPrices = async () => {
-  try {
-    // Fetch BUY prices
-    const buyResponse = await axios.post(
-      "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-      {
-        asset: "USDT",
-        fiat: "VND",
-        tradeType: "BUY",
-        page: 1,
-        rows: 10,
-        payTypes: [],
-        publisherType: null,
-        merchantCheck: false,
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    // Fetch SELL prices
-    const sellResponse = await axios.post(
-      "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-      {
-        asset: "USDT",
-        fiat: "VND",
-        tradeType: "SELL",
-        page: 1,
-        rows: 10,
-        payTypes: [],
-        publisherType: null,
-        merchantCheck: false,
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    // Parsing the response to extract the prices
-    const buyAds = buyResponse.data.data;
-    const sellAds = sellResponse.data.data;
-
-    const buyPrices = buyAds.map((ad) => ad.adv.price);
-    const sellPrices = sellAds.map((ad) => ad.adv.price);
-
-    let output = "MUA        -       BÁN\n";
-    for (let i = 0; i < Math.min(buyPrices.length, sellPrices.length); i++) {
-      output += `${parseFloat(
-        buyPrices[i]
-      ).toLocaleString()}             ${parseFloat(
-        sellPrices[i]
-      ).toLocaleString()}\n`;
-    }
-
-    return output;
-  } catch (error) {
-    console.error("Error fetching P2P prices:", error.message);
-  }
-};
+console.log("Bot is running!");
